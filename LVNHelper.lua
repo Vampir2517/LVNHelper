@@ -1,7 +1,7 @@
 script_name('LV News Helper')
 script_author('Vampir2615')
 script_description('Игровой помощник редактора LV News для Samp-RP')
-local script_version = '4.9.2'
+local script_version = '4.9.3'
 local update_url = 'https://raw.githubusercontent.com/Vampir2517/LVNHelper/main/version.ini'
 
 -- Проверка зависимостей: если модуля нет, скрипт честно скажет об этом в чате и выгрузится.
@@ -77,7 +77,7 @@ local autoGreeting = new.bool(false)
 local autoCameraRP = new.bool(false)
 local isBroadcastActive = new.bool(false)
 local rankTagBinder = new.bool(false)
-local updateCheckStatus = 'Обновления проверяются вручную по кнопке.'
+local updateCheckStatus = 'Проверка новых версий при запуске игры.'
 local selectedTemplate = 1
 local statusText = ''
 local statusColor = imgui.ImVec4(0.78, 0.86, 1.0, 1.0)
@@ -171,6 +171,12 @@ writeBuffer(dndMessage, 160, DEFAULT_DND_TEXT)
 -- Единый профиль ведущего для всех сценариев, RP-команд и викторин.
 -- Не зашиваем ник разработчика в публичный хелпер: берём его из настроек.
 local profile = {}
+profile.updater = {
+    dialog = new.bool(false), checking = false, downloading = false,
+    remoteVersion = nil, deferred = false, requestId = 0,
+    state = 'idle', details = '', progress = '',
+    sourceUrl = 'https://raw.githubusercontent.com/Vampir2517/LVNHelper/main/LVNHelper.lua',
+}
 -- Публичные контакты. Для включения ссылок ниже укажите реальный URL
 -- после создания GitHub-репозитория и темы BlastHack.
 -- USDT TRC20: только публичный адрес для получения переводов, не приватный ключ.
@@ -3204,6 +3210,11 @@ function main()
     local ped = getLocalPlayerPed()
     if ped then lastWeapon = getLocalWeapon(ped) or 0 end
     sampAddChatMessage(u8:decode('{A78BFA}[LVN Helper] {FFFFFF}Открыть помощник: {A78BFA}/lvn{FFFFFF}. Вставка текста настраивается в «Настройках».'), -1)
+    -- Однократная проверка в фоне после входа. Игра не блокируется, файлы не меняются.
+    lua_thread.create(function()
+        wait(1800)
+        profile.updater.check(true)
+    end)
     while true do
         wait(0)
         local modifierKey = availableModifiers[selectedModifier[0] + 1].key
@@ -4455,29 +4466,172 @@ local function drawSettings()
 end
 
 -- ── Раздел: О скрипте ────────────────────────────────────────────
-local function checkUpdates()
-    updateCheckStatus = 'Проверяю версию…'
-    local path = getWorkingDirectory() .. '\\version_server.ini'
-    downloadUrlToFile(update_url, path, function(_, status)
-        if status == 58 then
-            local file = io.open(path, 'r')
-            if file then
-                local remoteVersion = file:read('*a'):gsub('%s+', '')
-                file:close()
-                os.remove(path)
-                if remoteVersion ~= '' and remoteVersion ~= script_version then
-                    updateCheckStatus = 'В репозитории указана версия ' .. remoteVersion .. '; локальная сборка ' .. script_version .. '. Установка обновлений только вручную.'
-                elseif remoteVersion == script_version then
-                    updateCheckStatus = 'Репозиторий и локальная сборка совпадают: ' .. script_version .. '. Установка обновлений только вручную.'
-                else
-                    updateCheckStatus = 'Сервер версий вернул пустой ответ.'
-                end
-            else updateCheckStatus = 'Не удалось прочитать ответ сервера версий.' end
-        else
-            updateCheckStatus = 'Проверка обновлений не удалась (код ' .. tostring(status) .. ').'
+-- Обновления: только официальный HTTPS GitHub. Без телеметрии и фоновой установки.
+-- Загружаем во временный файл, проверяем версию + синтаксис, делаем резервную копию.
+do
+    profile.updater.later = function()
+        profile.updater.deferred = true
+        profile.updater.dialog[0] = false
+        updateCheckStatus = 'Обновление ' .. tostring(profile.updater.remoteVersion or '') .. ' отложено до следующего запуска.'
+    end
+
+    profile.updater.newer = function(remote, current)
+        local a,b,c = remote:match('^(%d+)%.(%d+)%.(%d+)$')
+        local x,y,z = current:match('^(%d+)%.(%d+)%.(%d+)$')
+        if not a or not x then return false end
+        a,b,c,x,y,z = tonumber(a),tonumber(b),tonumber(c),tonumber(x),tonumber(y),tonumber(z)
+        if a ~= x then return a > x end
+        if b ~= y then return b > y end
+        return c > z
+    end
+
+    profile.updater.fail = function(message)
+        profile.updater.state = 'error'
+        profile.updater.details = message
+        profile.updater.downloading = false
+        profile.updater.dialog[0] = true
+        updateCheckStatus = message
+        print('[LVN Helper Updater] ' .. message)
+    end
+
+    profile.updater.check = function(automatic)
+        if profile.updater.checking or profile.updater.downloading then return end
+        if not automatic then profile.updater.deferred = false end
+        profile.updater.checking = true
+        profile.updater.requestId = profile.updater.requestId + 1
+        local token = profile.updater.requestId
+        local path = thisScript().path .. '.version.' .. token .. '.tmp'
+        os.remove(path)
+        updateCheckStatus = 'Проверяю версию на GitHub…'
+        local ok, err = pcall(downloadUrlToFile, update_url .. '?t=' .. os.time(), path, function(_, status)
+            if status ~= 58 then return end
+            if token ~= profile.updater.requestId or not profile.updater.checking then os.remove(path); return end
+            profile.updater.checking = false
+            local f = io.open(path, 'rb')
+            local body = f and f:read('*a') or ''
+            if f then f:close() end
             os.remove(path)
+            local remote = body:match('^%s*(%d+%.%d+%.%d+)%s*$')
+            if not remote then
+                updateCheckStatus = 'Не удалось получить корректный номер версии с GitHub.'
+                return
+            end
+            if profile.updater.newer(remote, script_version) then
+                profile.updater.remoteVersion = remote
+                updateCheckStatus = 'Доступна новая версия ' .. remote .. ' (установлена ' .. script_version .. ').'
+                if not profile.updater.deferred then
+                    profile.updater.state = 'ready'
+                    profile.updater.dialog[0] = true
+                end
+            else
+                profile.updater.remoteVersion = nil
+                updateCheckStatus = 'Установлена актуальная версия: ' .. script_version .. '.'
+            end
+        end)
+        if not ok then
+            profile.updater.checking = false
+            updateCheckStatus = 'Не удалось начать проверку: ' .. tostring(err)
+            return
         end
-    end)
+        lua_thread.create(function()
+            wait(22000)
+            if profile.updater.requestId == token and profile.updater.checking then
+                profile.updater.checking = false
+                profile.updater.requestId = profile.updater.requestId + 1
+                updateCheckStatus = 'Нет ответа от GitHub. Проверьте интернет и повторите позже.'
+                os.remove(path)
+            end
+        end)
+    end
+
+    profile.updater.install = function()
+        if profile.updater.downloading or not profile.updater.remoteVersion
+            or not profile.updater.newer(profile.updater.remoteVersion, script_version) then return end
+        profile.updater.downloading = true
+        profile.updater.state = 'downloading'
+        profile.updater.progress = 'Подключение к GitHub…'
+        local expected = profile.updater.remoteVersion
+        local source = thisScript().path
+        local staged = source .. '.lvn-download.tmp' -- не .lua, MoonLoader его не запустит
+        os.remove(staged)
+        local finished = false
+        local ok, err = pcall(downloadUrlToFile, profile.updater.sourceUrl .. '?v=' .. expected, staged,
+            function(_, status, received, total)
+                if finished or not profile.updater.downloading then return end
+                if status == 5 and tonumber(total) and tonumber(total) > 0 then
+                    profile.updater.progress = string.format('Загрузка: %d%%',
+                        math.min(100, math.floor((tonumber(received) or 0) / tonumber(total) * 100)))
+                end
+                if status ~= 58 then return end
+                finished = true
+                local f = io.open(staged, 'rb')
+                local code = f and f:read('*a') or ''
+                if f then f:close() end
+                if #code < 100000 or #code > 3000000
+                    or not code:find("script_name('LV News Helper')", 1, true)
+                    or code:match("local script_version%s*=%s*['\"]([%d%.]+)['\"]") ~= expected then
+                    os.remove(staged)
+                    profile.updater.fail('Загружен неполный или неподходящий Lua. Старый скрипт сохранён.')
+                    return
+                end
+                -- loadfile только проверяет синтаксис: код обновления НЕ запускается заранее.
+                local chunk, syntaxError = loadfile(staged)
+                if not chunk then
+                    os.remove(staged)
+                    profile.updater.fail('Проверка Lua не пройдена: ' .. tostring(syntaxError))
+                    return
+                end
+                local backup = source .. '.backup-v' .. script_version
+                local n = 1
+                while doesFileExist(backup) and n < 100 do
+                    backup = source .. '.backup-v' .. script_version .. '-' .. n
+                    n = n + 1
+                end
+                if doesFileExist(backup) then
+                    os.remove(staged)
+                    profile.updater.fail('Не удалось выбрать имя резервной копии. Файл не изменён.')
+                    return
+                end
+                local moved, moveError = os.rename(source, backup)
+                if not moved then
+                    os.remove(staged)
+                    profile.updater.fail('Невозможно сохранить резервную копию: ' .. tostring(moveError))
+                    return
+                end
+                local replaced, replaceError = os.rename(staged, source)
+                if not replaced then
+                    local restored = os.rename(backup, source)
+                    profile.updater.fail('Ошибка замены файла: ' .. tostring(replaceError) ..
+                        (restored and '. Старый скрипт восстановлен.' or
+                        '. Восстановите вручную из файла ' .. backup))
+                    return
+                end
+                profile.updater.downloading = false
+                profile.updater.state = 'done'
+                profile.updater.progress = 'Готово. Перезапускаю LVN Helper…'
+                updateCheckStatus = 'Обновление ' .. expected .. ' установлено. Резервная копия: ' .. backup
+                -- Перезапускаем только LVN Helper, саму игру перезапускать не нужно.
+                lua_thread.create(function()
+                    wait(600)
+                    thisScript():reload()
+                end)
+            end)
+        if not ok then
+            profile.updater.downloading = false
+            os.remove(staged)
+            profile.updater.fail('Не удалось запустить загрузку: ' .. tostring(err))
+            return
+        end
+        lua_thread.create(function()
+            wait(45000)
+            if profile.updater.downloading and not finished then
+                profile.updater.downloading = false
+                profile.updater.fail('Загрузка превысила время ожидания. Старый скрипт не изменён.')
+                -- Временный файл не удаляем здесь: загрузка ещё может записывать его.
+            end
+        end)
+    end
+
 end
 
 local dependencyRows
@@ -4534,7 +4688,7 @@ local function drawAbout()
 
     sectionLabel('Обновления')
     if profile.support.updates_ready then
-        if styledButton('Проверить обновления', S(220), S(34), 'primary') then checkUpdates() end
+        if styledButton('Проверить обновления', S(220), S(34), 'primary') then profile.updater.check(false) end
         spacing(2)
         muted(updateCheckStatus)
     else
@@ -4782,6 +4936,43 @@ local mainFrame = imgui.OnFrame(function() return opened[0] end, function(self)
         drawSidebar(height)
         imgui.SameLine(0, 0)
         drawContent(height)
+    end
+    imgui.End()
+end)
+
+-- Отдельное окно предложения обновления: видно сразу после запуска, без открытия /lvn.
+profile.updateOfferFrame = imgui.OnFrame(function() return profile.updater.dialog[0] end, function(self)
+    local sw, sh = getScreenResolution()
+    imgui.SetNextWindowPos(V2(sw / 2, sh / 2), imgui.Cond.Always, V2(0.5, 0.5))
+    imgui.SetNextWindowSize(V2(S(505), S(225)), imgui.Cond.Always)
+    local flags = imgui.WindowFlags.NoResize + imgui.WindowFlags.NoCollapse
+        + imgui.WindowFlags.NoSavedSettings
+    if imgui.Begin(u8'Обновление LVN Helper##updater', profile.updater.dialog, flags) then
+        imgui.TextColored(C.accentHi, u8'ДОСТУПНО ОБНОВЛЕНИЕ')
+        imgui.Separator()
+        spacing(6)
+        imgui.Text(u8('Установлено: ' .. script_version))
+        imgui.Text(u8('Новая версия: ' .. tostring(profile.updater.remoteVersion or '?')))
+        spacing(5)
+        if profile.updater.state == 'downloading' then
+            imgui.Text(u8(profile.updater.progress))
+            muted('Пожалуйста, не закрывайте игру до окончания установки.')
+        elseif profile.updater.state == 'error' then
+            imgui.TextColored(C.bad, u8'Ошибка обновления')
+            muted(profile.updater.details)
+            spacing(6)
+            if styledButton('Повторить', S(230), S(36), 'primary') then profile.updater.install() end
+            imgui.SameLine()
+            if styledButton('Позже', S(230), S(36)) then profile.updater.later() end
+        elseif profile.updater.state == 'done' then
+            imgui.TextColored(C.ok, u8(profile.updater.progress))
+        else
+            muted('Скачать проверенную версию с GitHub и перезапустить только хелпер?')
+            spacing(6)
+            if styledButton('Обновить', S(230), S(36), 'primary') then profile.updater.install() end
+            imgui.SameLine()
+            if styledButton('Позже', S(230), S(36)) then profile.updater.later() end
+        end
     end
     imgui.End()
 end)
