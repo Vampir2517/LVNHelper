@@ -178,7 +178,7 @@ profile.support = {
     telegram = '@XT0y4',
     usdt_trc20 = 'TJ1qY2sPB6p2R3GRdcSpegXuUbHEugazD8',
     github_issues_url = 'https://github.com/Vampir2517/LVNHelper/issues',  -- публиковать сборку после создания репозитория
-    blasthack_thread_url = '', -- после публикации темы: https://www.blast.hk/threads/<id>/
+    blasthack_thread_url = 'https://www.blast.hk/threads/259272/', -- официальная тема LVN Helper на BlastHack
     updates_ready = true, -- сборка предназначена для установки ПОСЛЕ размещения version.ini в публичном GitHub/main
 }
 
